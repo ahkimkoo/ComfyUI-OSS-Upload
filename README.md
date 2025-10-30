@@ -4,8 +4,10 @@ A ComfyUI plugin for uploading generated images and videos to Alibaba Cloud OSS 
 
 ## Features
 
-- **Image Upload Node**: Upload ComfyUI generated images to OSS
+- **Image Upload Node**: Upload ComyUI generated images to OSS
 - **Video Upload Node**: Upload videos (compatible with VideoHelperSuite) to OSS
+- **Audio Upload Node**: Upload audio files to OSS
+- **Automatic Retry**: Automatically retries uploads up to 10 times on failure
 - **Random Filename Generation**: Option to generate random filenames with timestamp
 - **Custom Filename**: Option to specify custom filenames
 - **Configurable OSS Settings**: Support for custom endpoint, bucket, access keys, and paths
@@ -29,6 +31,21 @@ A ComfyUI plugin for uploading generated images and videos to Alibaba Cloud OSS 
 - `access_key`: Access Key ID
 - `access_secret`: Access Key Secret
 - `path`: OSS storage path (e.g., comfyui/images)
+- `random_filename`: Boolean to enable/disable random filename generation
+- `filename`: Custom filename (used when random_filename is False)
+
+**Output:**
+- `url`: Complete URL of the uploaded file on OSS
+
+### Audio Upload Node (OSS Audio Uploader)
+
+**Inputs:**
+- `audio`: AUDIO type from ComfyUI
+- `endpoint`: OSS endpoint (e.g., https://oss-cn-hangzhou.aliyuncs.com)
+- `bucket`: OSS bucket name
+- `access_key`: Access Key ID
+- `access_secret`: Access Key Secret
+- `path`: OSS storage path (e.g., comfyui/audio)
 - `random_filename`: Boolean to enable/disable random filename generation
 - `filename`: Custom filename (used when random_filename is False)
 
@@ -79,3 +96,4 @@ Example: `20241210_143052_a3k9m2p7.png`
 - Compatible with VideoHelperSuite for video uploads
 - Supports common image formats: PNG, JPG, JPEG, WebP
 - Supports common video formats: MP4, AVI, MOV, WebM, MKV
+- Supports common audio formats: WAV, MP3, FLAC
