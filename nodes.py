@@ -200,12 +200,12 @@ class OSSVideoUploader:
             video_path = None
             if isinstance(VHS_FILENAMES, (list, tuple)) and len(VHS_FILENAMES) >= 2:
                 if isinstance(VHS_FILENAMES[0], bool) and isinstance(VHS_FILENAMES[1], (list, tuple)):
-                    video_files = [f for f in VHS_FILENAMES[1] if f.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.mkv'))]
+                    video_files = [f for f in VHS_FILENAMES[1] if f.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.mkv', '.gif'))]
                     if video_files:
                         video_path = video_files[-1]
                 else:
                     for item in VHS_FILENAMES:
-                        if isinstance(item, str) and item.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.mkv')):
+                        if isinstance(item, str) and item.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.mkv', '.gif')):
                             video_path = item
                             break
                     if not video_path:
@@ -225,7 +225,7 @@ class OSSVideoUploader:
             if random_filename:
                 filename = self.generate_random_filename(ext.lstrip('.'))
             else:
-                if not filename.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.mkv')):
+                if not filename.lower().endswith(('.mp4', '.avi', '.mov', '.webm', '.mkv', '.gif')):
                     filename += ext
 
             auth = oss2.Auth(access_key, access_secret)
