@@ -99,10 +99,10 @@ Enabled by default on image & video nodes. When not specified by the caller, the
 | `enable_invisible_watermark` | BOOLEAN | `True` (`False` on File node) | Enable/disable GB 45438-2025 implicit metadata |
 | `invisible_watermark_label` | COMBO | `"1"` | `"1"` (AI-generated), `"2"` (possibly), `"3"` (suspected) |
 | `invisible_watermark_producer` | STRING | `""` | Platform name / 27-digit code; falls back to env `AIGC_CONTENT_PRODUCER` → `"CAICAI-菜菜AI"` |
-| `invisible_watermark_produce_id` | STRING | `""` | Unique task/content ID; auto-generated (`PROD_<timestamp>_<uuid>`) if empty |
+| `invisible_watermark_produce_id` | STRING | `""` | Unique 32-char content ID; auto-generated (`CAICAI<14-digit-ts><12-hex>`) if empty |
 | `invisible_watermark_reserved_code1` | STRING | `""` | Optional reserved field / signature |
-| `invisible_watermark_propagator` | STRING | `""` | Optional propagator platform name/code (or env `AIGC_CONTENT_PROPAGATOR`) |
-| `invisible_watermark_propagate_id` | STRING | `""` | Optional propagation ID |
+| `invisible_watermark_propagator` | STRING | `""` | Propagator platform; falls back to env `AIGC_CONTENT_PROPAGATOR` → `ContentProducer` (`"CAICAI-菜菜AI"`) |
+| `invisible_watermark_propagate_id` | STRING | `""` | Propagation ID; defaults to `ProduceID` if empty |
 | `invisible_watermark_reserved_code2` | STRING | `""` | Optional reserved field 2 |
 
 ### 2. Visible Watermark Group (显性水印 — 图片叠加)
@@ -125,10 +125,10 @@ All 7 GB 45438-2025 implicit metadata fields are always written (empty optional 
 {
   "Label": "1",
   "ContentProducer": "CAICAI-菜菜AI",
-  "ProduceID": "PROD_20261125151629_7964cd51a2be",
+  "ProduceID": "CAICAI20261125162611a1b2c3d4e5f6",
   "ReservedCode1": "",
-  "ContentPropagator": "",
-  "PropagateID": "",
+  "ContentPropagator": "CAICAI-菜菜AI",
+  "PropagateID": "CAICAI20261125162611a1b2c3d4e5f6",
   "ReservedCode2": ""
 }
 ```

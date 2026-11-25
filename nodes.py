@@ -62,7 +62,7 @@ def _watermark_optional_inputs(default_invisible_enabled: bool = True):
             {
                 "default": "",
                 "multiline": False,
-                "placeholder": "内容唯一ID (留空自动生成)",
+                "placeholder": "内容制作编号 (留空自动生成32位 CAICAI 编号)",
             },
         ),
         "invisible_watermark_reserved_code1": (
@@ -78,7 +78,7 @@ def _watermark_optional_inputs(default_invisible_enabled: bool = True):
             {
                 "default": "",
                 "multiline": False,
-                "placeholder": "传播平台名称/编码 (可选)",
+                "placeholder": f"传播平台名称/编码 (留空同 Producer，默认 {DEFAULT_CONTENT_PRODUCER})",
             },
         ),
         "invisible_watermark_propagate_id": (
@@ -86,7 +86,7 @@ def _watermark_optional_inputs(default_invisible_enabled: bool = True):
             {
                 "default": "",
                 "multiline": False,
-                "placeholder": "传播唯一ID (可选)",
+                "placeholder": "内容传播编号 (留空默认同 ProduceID)",
             },
         ),
         "invisible_watermark_reserved_code2": (

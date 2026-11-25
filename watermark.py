@@ -115,8 +115,10 @@ class AIGCMetadata:
         ).strip() or DEFAULT_CONTENT_PRODUCER
         self.produce_id = (self.produce_id or "").strip() or generate_produce_id()
         self.reserved_code1 = (self.reserved_code1 or "").strip()
-        self.content_propagator = (self.content_propagator or "").strip()
-        self.propagate_id = (self.propagate_id or "").strip()
+        self.content_propagator = (
+            self.content_propagator or ""
+        ).strip() or self.content_producer
+        self.propagate_id = (self.propagate_id or "").strip() or self.produce_id
         self.reserved_code2 = (self.reserved_code2 or "").strip()
 
     def to_payload_dict(self) -> Dict[str, str]:
@@ -187,10 +189,15 @@ class VisibleWatermarkConfig:
         return bool(self.image_url)
 
 
-def generate_produce_id(prefix: str = "PROD") -> str:
-    """Generate a unique ProduceID with timestamp and random UUID suffix."""
+def generate_produce_id(prefix: str = "CAICAI") -> str:
+    """
+    Generate a 32-character alphanumeric ProduceID compliant with GB 45438-2025:
+    <prefix (6)> + <YYYYMMDDHHMMSS (14)> + <random hex (12)> = 32 chars.
+    """
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    return f"{prefix}_{ts}_{uuid.uuid4().hex[:12]}"
+    clean_prefix = re.sub(r"[^A-Za-z0-9]", "", prefix or "CAICAI")[:6] or "CAICAI"
+    rand_len = max(6, 32 - len(clean_prefix) - len(ts))
+    return f"{clean_prefix}{ts}{uuid.uuid4().hex[:rand_len]}"
 
 
 def build_aigc_metadata(
@@ -203,8 +210,11 @@ def build_aigc_metadata(
     reserved_code2: str = "",
 ) -> AIGCMetadata:
     """
-    Create AIGCMetadata resolving node inputs -> environment variables -> default
-    ("CAICAI-菜菜AI").
+    Create AIGCMetadata resolving node inputs -> environment variables -> defaults:
+    - ContentProducer: input -> env AIGC_CONTENT_PRODUCER -> "CAICAI-菜菜AI"
+    - ProduceID: input -> auto-generated 32-char CAICAI<timestamp><hex>
+    - ContentPropagator: input -> env AIGC_CONTENT_PROPAGATOR -> ContentProducer
+    - PropagateID: input -> ProduceID
     """
     resolved_producer = (
         (content_producer or "").strip()
@@ -214,14 +224,17 @@ def build_aigc_metadata(
     resolved_propagator = (
         (content_propagator or "").strip()
         or os.environ.get("AIGC_CONTENT_PROPAGATOR", "").strip()
+        or resolved_producer
     )
+    resolved_produce_id = (produce_id or "").strip() or generate_produce_id()
+    resolved_propagate_id = (propagate_id or "").strip() or resolved_produce_id
     return AIGCMetadata(
         label=label,
         content_producer=resolved_producer,
-        produce_id=produce_id,
+        produce_id=resolved_produce_id,
         reserved_code1=reserved_code1,
         content_propagator=resolved_propagator,
-        propagate_id=propagate_id,
+        propagate_id=resolved_propagate_id,
         reserved_code2=reserved_code2,
     )
 
