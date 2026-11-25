@@ -74,6 +74,10 @@ _WM_URL_CACHE: Dict[str, Tuple[float, bytes]] = {}
 _WM_URL_CACHE_LOCK = threading.Lock()
 _WM_URL_CACHE_TTL_SECONDS = 600
 
+# Cached NVENC encoder flags per ffmpeg binary: ffmpeg_bin -> Optional[List[str]]
+_NVENC_ARGS_CACHE: Dict[str, Optional[List[str]]] = {}
+_NVENC_CACHE_LOCK = threading.Lock()
+
 
 def register_image_watermark_hook(hook: ImageWatermarkHook) -> None:
     """Register an optional pixel-level blind image watermark processor (for future upgrades)."""
@@ -691,6 +695,136 @@ def _embed_gif_watermark(
     return output_path
 
 
+def _detect_h264_nvenc_args(ffmpeg_bin: str) -> Optional[List[str]]:
+    """
+    Probe once per process whether NVIDIA h264_nvenc works in this runtime.
+    Returns encoder CLI args if usable, otherwise None (graceful CPU fallback).
+    """
+    if os.environ.get("AIGC_DISABLE_NVENC", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return None
+
+    with _NVENC_CACHE_LOCK:
+        if ffmpeg_bin in _NVENC_ARGS_CACHE:
+            return _NVENC_ARGS_CACHE[ffmpeg_bin]
+
+    candidates = [
+        ["-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", "20", "-pix_fmt", "yuv420p"],
+        ["-c:v", "h264_nvenc", "-preset", "fast", "-cq", "20", "-pix_fmt", "yuv420p"],
+    ]
+
+    detected: Optional[List[str]] = None
+    for args in candidates:
+        try:
+            res = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=64x64:d=0.04",
+                    "-frames:v",
+                    "1",
+                    *args,
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if res.returncode == 0:
+                detected = args
+                break
+        except Exception:
+            continue
+
+    with _NVENC_CACHE_LOCK:
+        _NVENC_ARGS_CACHE[ffmpeg_bin] = detected
+    return detected
+
+
+def _cpu_h264_args() -> List[str]:
+    """Return fast CPU libx264 encoding flags (overridable via AIGC_VIDEO_PRESET)."""
+    preset = os.environ.get("AIGC_VIDEO_PRESET", "veryfast").strip() or "veryfast"
+    return [
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        preset,
+        "-crf",
+        "20",
+        "-threads",
+        "0",
+    ]
+
+
+def _build_ffmpeg_video_cmd(
+    ffmpeg_bin: str,
+    current_input: str,
+    output_path: str,
+    ext: str,
+    has_visible: bool,
+    wm_tmp_path: Optional[str],
+    overlay_xy: Optional[Tuple[int, int]],
+    video_codec_args: List[str],
+    metadata: Optional[AIGCMetadata],
+) -> List[str]:
+    cmd: List[str] = [ffmpeg_bin, "-y", "-i", current_input]
+
+    if has_visible and wm_tmp_path is not None and overlay_xy is not None:
+        x, y = overlay_xy
+        cmd.extend(["-i", wm_tmp_path])
+        cmd.extend(
+            [
+                "-filter_complex",
+                f"[0:v][1:v]overlay=x={x}:y={y}:format=yuv420[vout]",
+                "-map",
+                "[vout]",
+                "-map",
+                "0:a?",
+                "-map_metadata",
+                "0",
+                "-c:a",
+                "copy",
+                *video_codec_args,
+            ]
+        )
+    else:
+        cmd.extend(["-map_metadata", "0", "-c", "copy"])
+
+    # MP4 / MOV require use_metadata_tags so custom 'AIGC' tag is written into QuickTime keys
+    if ext in (".mp4", ".mov", ".m4v"):
+        if has_visible:
+            cmd.extend(["-movflags", "+faststart+use_metadata_tags"])
+        elif metadata is not None:
+            cmd.extend(["-movflags", "use_metadata_tags"])
+
+    if metadata is not None:
+        payload_json = metadata.to_payload_json()
+        wrapped_json = metadata.to_wrapped_json()
+        cmd.extend(
+            [
+                "-metadata",
+                f"AIGC={payload_json}",
+                "-metadata",
+                f"comment={wrapped_json}",
+                "-metadata",
+                f"description={wrapped_json}",
+            ]
+        )
+
+    cmd.append(output_path)
+    return cmd
+
+
 def embed_video_watermark(
     input_path: str,
     output_path: str,
@@ -701,8 +835,9 @@ def embed_video_watermark(
     Apply optional visible image overlay and/or GB 45438-2025 invisible metadata to a video.
 
     - When only invisible metadata is enabled: fast lossless stream copy (-c copy).
-    - When visible watermark is enabled: single-pass FFmpeg overlay + metadata write
-      (audio stream is copied losslessly).
+    - When visible watermark is enabled: single-pass FFmpeg overlay in YUV420 space
+      using NVIDIA h264_nvenc when available (with automatic CPU libx264 veryfast fallback)
+      and lossless audio stream copy (-c:a copy).
     """
     has_visible = bool(visible_config and visible_config.is_valid)
     has_invisible = metadata is not None
@@ -742,11 +877,15 @@ def embed_video_watermark(
                 "ffmpeg not found in PATH or imageio_ffmpeg; cannot process video watermark."
             )
 
-        cmd: List[str] = [ffmpeg_bin, "-y", "-i", current_input]
+        wm_tmp_path: Optional[str] = None
+        overlay_xy: Optional[Tuple[int, int]] = None
+        codec_attempts: List[List[str]] = [[]]
 
         if has_visible and visible_config is not None:
             vid_w, vid_h = _probe_video_dimensions(current_input, ffmpeg_bin)
-            wm_img, (x, y) = prepare_visible_watermark((vid_w, vid_h), visible_config)
+            wm_img, overlay_xy = prepare_visible_watermark(
+                (vid_w, vid_h), visible_config
+            )
             wm_tmp_fd, wm_tmp_path = tempfile.mkstemp(
                 prefix="aigc_vis_wm_", suffix=".png"
             )
@@ -754,69 +893,36 @@ def embed_video_watermark(
             wm_img.save(wm_tmp_path, format="PNG")
             intermediate_files.append(wm_tmp_path)
 
-            cmd.extend(["-i", wm_tmp_path])
-            cmd.extend(
-                [
-                    "-filter_complex",
-                    f"[0:v][1:v]overlay=x={x}:y={y}:format=auto[vout]",
-                    "-map",
-                    "[vout]",
-                    "-map",
-                    "0:a?",
-                    "-map_metadata",
-                    "0",
-                    "-c:a",
-                    "copy",
-                ]
-            )
             if ext == ".webm":
-                cmd.extend(["-c:v", "libvpx-vp9", "-crf", "24", "-b:v", "0"])
+                codec_attempts = [["-c:v", "libvpx-vp9", "-crf", "24", "-b:v", "0", "-deadline", "realtime"]]
             else:
-                cmd.extend(
-                    [
-                        "-c:v",
-                        "libx264",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-preset",
-                        "fast",
-                        "-crf",
-                        "18",
-                    ]
+                nvenc_args = _detect_h264_nvenc_args(ffmpeg_bin)
+                cpu_args = _cpu_h264_args()
+                codec_attempts = [nvenc_args, cpu_args] if nvenc_args else [cpu_args]
+
+        last_err = ""
+        for attempt_idx, codec_args in enumerate(codec_attempts):
+            cmd = _build_ffmpeg_video_cmd(
+                ffmpeg_bin=ffmpeg_bin,
+                current_input=current_input,
+                output_path=output_path,
+                ext=ext,
+                has_visible=has_visible,
+                wm_tmp_path=wm_tmp_path,
+                overlay_xy=overlay_xy,
+                video_codec_args=codec_args,
+                metadata=metadata,
+            )
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return output_path
+            last_err = result.stderr.strip()
+            if attempt_idx + 1 < len(codec_attempts):
+                print(
+                    "[WARNING] GPU h264_nvenc overlay encode failed; falling back to CPU libx264."
                 )
-        else:
-            cmd.extend(["-map_metadata", "0", "-c", "copy"])
 
-        # MP4 / MOV require use_metadata_tags so custom 'AIGC' tag is written into QuickTime keys
-        if ext in (".mp4", ".mov", ".m4v"):
-            if has_visible:
-                cmd.extend(["-movflags", "+faststart+use_metadata_tags"])
-            elif has_invisible:
-                cmd.extend(["-movflags", "use_metadata_tags"])
-
-        if has_invisible and metadata is not None:
-            payload_json = metadata.to_payload_json()
-            wrapped_json = metadata.to_wrapped_json()
-            cmd.extend(
-                [
-                    "-metadata",
-                    f"AIGC={payload_json}",
-                    "-metadata",
-                    f"comment={wrapped_json}",
-                    "-metadata",
-                    f"description={wrapped_json}",
-                ]
-            )
-
-        cmd.append(output_path)
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ffmpeg failed to embed video watermark (code {result.returncode}): {result.stderr.strip()}"
-            )
-
-        return output_path
+        raise RuntimeError(f"ffmpeg failed to embed video watermark: {last_err}")
     finally:
         for fpath in intermediate_files:
             if os.path.exists(fpath):

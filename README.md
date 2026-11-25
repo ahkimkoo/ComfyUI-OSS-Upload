@@ -154,7 +154,7 @@ Example ComfyUI workflow node inputs (for AI platform task submission):
 - **JPEG / WebP**: EXIF (`UserComment` + `ImageDescription`) + XMP (`TC260:AIGC`)
 - **MP4 / MOV / M4V / MKV / WebM / AVI**:
   - Invisible watermark only: fast lossless stream copy (`ffmpeg -c copy`)
-  - Visible watermark enabled: single-pass FFmpeg overlay (`-c:a copy` preserves audio) + invisible metadata written in the same pass
+  - Visible watermark enabled: single-pass FFmpeg YUV420 overlay using NVIDIA `h264_nvenc` when available (auto-fallback to CPU `libx264 -preset veryfast`, configurable via `AIGC_VIDEO_PRESET` / `AIGC_DISABLE_NVENC`), `-c:a copy` preserves audio + invisible metadata written in the same pass
 - **GIF**: Composites visible watermark onto every frame while preserving animation timing + writes GB 45438 `comment` block
 
 ### Future Blind Watermark Extension
