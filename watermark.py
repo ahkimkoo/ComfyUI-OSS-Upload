@@ -51,6 +51,7 @@ VISIBLE_WATERMARK_POSITIONS = (
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".gif")
+AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 
 # Exif tag IDs
 _TAG_IMAGE_DESCRIPTION = 0x010E
@@ -63,11 +64,14 @@ _RESAMPLE_LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 # Optional future blind-watermark processor hooks:
 #   image processor: (PIL.Image.Image, AIGCMetadata) -> PIL.Image.Image
 #   video processor: (input_path: str, output_path: str, AIGCMetadata) -> str
+#   audio processor: (input_path: str, output_path: str, AIGCMetadata) -> str
 ImageWatermarkHook = Callable[[Image.Image, "AIGCMetadata"], Image.Image]
 VideoWatermarkHook = Callable[[str, str, "AIGCMetadata"], str]
+AudioWatermarkHook = Callable[[str, str, "AIGCMetadata"], str]
 
 _IMAGE_WATERMARK_HOOKS: List[ImageWatermarkHook] = []
 _VIDEO_WATERMARK_HOOKS: List[VideoWatermarkHook] = []
+_AUDIO_WATERMARK_HOOKS: List[AudioWatermarkHook] = []
 
 # Simple in-memory URL cache for watermark images: url -> (timestamp, raw_bytes)
 _WM_URL_CACHE: Dict[str, Tuple[float, bytes]] = {}
@@ -87,6 +91,11 @@ def register_image_watermark_hook(hook: ImageWatermarkHook) -> None:
 def register_video_watermark_hook(hook: VideoWatermarkHook) -> None:
     """Register an optional frame-level blind video watermark processor (for future upgrades)."""
     _VIDEO_WATERMARK_HOOKS.append(hook)
+
+
+def register_audio_watermark_hook(hook: AudioWatermarkHook) -> None:
+    """Register an optional waveform-level blind audio watermark processor (e.g., AudioSeal)."""
+    _AUDIO_WATERMARK_HOOKS.append(hook)
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +952,230 @@ def embed_video_watermark(
                     os.remove(fpath)
                 except OSError:
                     pass
+
+
+# ---------------------------------------------------------------------------
+# Audio Watermarking (GB 45438-2025 Invisible Metadata)
+# ---------------------------------------------------------------------------
+
+
+def _append_wav_riff_info_comment(
+    input_path: str, output_path: str, comment_text: str
+) -> str:
+    """
+    Pure-Python fallback for embedding a RIFF LIST/INFO/ICMT chunk into a WAV file
+    when ffmpeg is unavailable.
+    """
+    with open(input_path, "rb") as f:
+        data = bytearray(f.read())
+
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError(f"Not a valid RIFF WAVE file: {input_path}")
+
+    # Pad existing file data to even byte boundary per RIFF spec
+    if len(data) % 2 == 1:
+        data.append(0)
+
+    icmt_payload = comment_text.encode("utf-8") + b"\x00"
+    icmt_chunk = b"ICMT" + len(icmt_payload).to_bytes(4, "little") + icmt_payload
+    if len(icmt_payload) % 2 == 1:
+        icmt_chunk += b"\x00"
+
+    list_body = b"INFO" + icmt_chunk
+    list_chunk = b"LIST" + len(list_body).to_bytes(4, "little") + list_body
+
+    data.extend(list_chunk)
+    new_riff_size = len(data) - 8
+    data[4:8] = new_riff_size.to_bytes(4, "little")
+
+    with open(output_path, "wb") as f:
+        f.write(data)
+    return output_path
+
+
+def _read_wav_riff_info_comment(file_path: str) -> Optional[str]:
+    """Pure-Python fallback reader for RIFF LIST/INFO/ICMT comment chunk in WAV."""
+    try:
+        with open(file_path, "rb") as f:
+            data = f.read()
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+            return None
+        pos = 12
+        while pos + 8 <= len(data):
+            cid = data[pos : pos + 4]
+            csize = int.from_bytes(data[pos + 4 : pos + 8], "little")
+            body_start = pos + 8
+            body_end = body_start + csize
+            if cid == b"LIST" and data[body_start : body_start + 4] == b"INFO":
+                sub = body_start + 4
+                while sub + 8 <= body_end:
+                    sid = data[sub : sub + 4]
+                    ssize = int.from_bytes(data[sub + 4 : sub + 8], "little")
+                    sbody = data[sub + 8 : sub + 8 + ssize]
+                    if sid == b"ICMT":
+                        return sbody.rstrip(b"\x00").decode("utf-8", errors="ignore")
+                    sub += 8 + ssize + (ssize % 2)
+            pos = body_end + (csize % 2)
+    except Exception:
+        return None
+    return None
+
+
+def embed_audio_watermark(
+    input_path: str,
+    output_path: str,
+    metadata: Optional[AIGCMetadata] = None,
+) -> str:
+    """
+    Embed GB 45438-2025 invisible metadata into an audio file.
+
+    - Supports WAV (RIFF INFO), MP3 (ID3v2), FLAC (Vorbis Comments),
+      M4A/AAC (QuickTime/iTunes atoms), OGG/OPUS (Vorbis/Opus comments).
+    - Uses lossless stream copy (-c copy) when container format matches;
+      encodes cleanly if converting (e.g. WAV -> MP3/FLAC/M4A).
+    - Falls back to pure-Python RIFF LIST/INFO injection for WAV if ffmpeg is missing.
+    """
+    if metadata is None:
+        if os.path.abspath(input_path) != os.path.abspath(output_path):
+            shutil.copy2(input_path, output_path)
+        return output_path
+
+    current_input = input_path
+    intermediate_files: List[str] = []
+
+    try:
+        # Optional future waveform-level blind watermark hooks (e.g., AudioSeal)
+        for idx, hook in enumerate(_AUDIO_WATERMARK_HOOKS):
+            base, ext_h = os.path.splitext(output_path)
+            hook_out = f"{base}_ahook{idx}{ext_h}"
+            current_input = hook(current_input, hook_out, metadata)
+            if hook_out != output_path:
+                intermediate_files.append(hook_out)
+
+        in_ext = os.path.splitext(current_input)[1].lower()
+        out_ext = os.path.splitext(output_path)[1].lower() or in_ext
+
+        ffmpeg_bin = _find_ffmpeg()
+        if not ffmpeg_bin:
+            if out_ext == ".wav" and in_ext == ".wav":
+                return _append_wav_riff_info_comment(
+                    current_input, output_path, metadata.to_wrapped_json()
+                )
+            raise RuntimeError(
+                "ffmpeg not found in PATH or imageio_ffmpeg; cannot embed audio AIGC metadata."
+            )
+
+        payload_json = metadata.to_payload_json()
+        wrapped_json = metadata.to_wrapped_json()
+
+        cmd: List[str] = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            current_input,
+            "-map_metadata",
+            "0",
+        ]
+
+        if in_ext == out_ext:
+            cmd.extend(["-c", "copy"])
+        elif out_ext == ".mp3":
+            cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+        elif out_ext == ".flac":
+            cmd.extend(["-c:a", "flac"])
+        elif out_ext in (".m4a", ".aac"):
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        elif out_ext == ".opus":
+            cmd.extend(["-c:a", "libopus", "-b:a", "128k"])
+        elif out_ext == ".ogg":
+            cmd.extend(["-c:a", "libvorbis", "-q:a", "4"])
+        else:
+            cmd.extend(["-c", "copy"])
+
+        if out_ext == ".mp3":
+            cmd.extend(["-id3v2_version", "3"])
+        elif out_ext == ".m4a":
+            cmd.extend(["-movflags", "use_metadata_tags"])
+
+        cmd.extend(
+            [
+                "-metadata",
+                f"AIGC={payload_json}",
+                "-metadata",
+                f"comment={wrapped_json}",
+                output_path,
+            ]
+        )
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed to embed audio watermark (code {result.returncode}): {result.stderr.strip()}"
+            )
+
+        return output_path
+    finally:
+        for fpath in intermediate_files:
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+
+
+def read_audio_watermark(file_path: str) -> Optional[Dict[str, str]]:
+    """Read and parse GB 45438 AIGC invisible metadata from an audio file."""
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin:
+        result = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            try:
+                info = json.loads(result.stdout)
+                tag_sources = [info.get("format", {}).get("tags", {})]
+                for stream in info.get("streams", []):
+                    if isinstance(stream, dict) and stream.get("tags"):
+                        tag_sources.append(stream["tags"])
+
+                for tags in tag_sources:
+                    lower_tags = {k.lower(): v for k, v in tags.items()}
+                    for key in ("aigc", "comment", "description"):
+                        val = lower_tags.get(key)
+                        if not val:
+                            continue
+                        try:
+                            parsed = json.loads(val)
+                            if isinstance(parsed, dict):
+                                return parsed.get("AIGC", parsed)
+                        except json.JSONDecodeError:
+                            continue
+            except json.JSONDecodeError:
+                pass
+
+    # Pure-Python WAV RIFF INFO fallback
+    if os.path.splitext(file_path)[1].lower() == ".wav":
+        comment = _read_wav_riff_info_comment(file_path)
+        if comment:
+            try:
+                parsed = json.loads(comment)
+                if isinstance(parsed, dict):
+                    return parsed.get("AIGC", parsed)
+            except json.JSONDecodeError:
+                pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -15,39 +15,38 @@ import scipy.io.wavfile
 
 try:
     from .watermark import (
+        AUDIO_EXTENSIONS,
         DEFAULT_CONTENT_PRODUCER,
         IMAGE_EXTENSIONS,
         VIDEO_EXTENSIONS,
         VISIBLE_WATERMARK_POSITIONS,
         build_aigc_metadata,
         build_visible_watermark,
+        embed_audio_watermark,
         embed_image_file_watermark,
         embed_video_watermark,
         save_image_with_watermark,
     )
 except ImportError:
     from watermark import (
+        AUDIO_EXTENSIONS,
         DEFAULT_CONTENT_PRODUCER,
         IMAGE_EXTENSIONS,
         VIDEO_EXTENSIONS,
         VISIBLE_WATERMARK_POSITIONS,
         build_aigc_metadata,
         build_visible_watermark,
+        embed_audio_watermark,
         embed_image_file_watermark,
         embed_video_watermark,
         save_image_with_watermark,
     )
 
 
-def _watermark_optional_inputs(default_invisible_enabled: bool = True):
-    """
-    Shared optional ComfyUI inputs exposing two watermark groups:
-    1. Invisible watermark (GB 45438-2025 implicit metadata, default ON with producer "CAICAI-菜菜AI")
-    2. Visible watermark (image URL overlay, default OFF)
-    """
+def _invisible_watermark_optional_inputs(default_enabled: bool = True):
+    """Shared optional ComfyUI inputs for GB 45438-2025 invisible watermark."""
     return {
-        # --- Invisible Watermark Group (隐形水印组) ---
-        "enable_invisible_watermark": ("BOOLEAN", {"default": default_invisible_enabled}),
+        "enable_invisible_watermark": ("BOOLEAN", {"default": default_enabled}),
         "invisible_watermark_label": (["1", "2", "3"], {"default": "1"}),
         "invisible_watermark_producer": (
             "STRING",
@@ -97,7 +96,12 @@ def _watermark_optional_inputs(default_invisible_enabled: bool = True):
                 "placeholder": "预留字段2 (可选)",
             },
         ),
-        # --- Visible Watermark Group (显性水印组) ---
+    }
+
+
+def _visible_watermark_optional_inputs():
+    """Shared optional ComfyUI inputs for visible image-overlay watermark."""
+    return {
         "enable_visible_watermark": ("BOOLEAN", {"default": False}),
         "visible_watermark_url": (
             "STRING",
@@ -128,6 +132,15 @@ def _watermark_optional_inputs(default_invisible_enabled: bool = True):
             {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05},
         ),
     }
+
+
+def _watermark_optional_inputs(default_invisible_enabled: bool = True):
+    """Combined optional inputs exposing both invisible and visible watermark groups."""
+    merged = _invisible_watermark_optional_inputs(
+        default_enabled=default_invisible_enabled
+    )
+    merged.update(_visible_watermark_optional_inputs())
+    return merged
 
 
 def _resolve_watermark_configs(
@@ -649,7 +662,8 @@ class OSSAudioUploader:
                         "placeholder": "Filename (only used when random_filename is False)",
                     },
                 ),
-            }
+            },
+            "optional": _invisible_watermark_optional_inputs(default_enabled=True),
         }
 
     RETURN_TYPES = ("STRING",)
@@ -675,8 +689,18 @@ class OSSAudioUploader:
         path,
         random_filename,
         filename,
+        enable_invisible_watermark=True,
+        invisible_watermark_label="1",
+        invisible_watermark_producer="",
+        invisible_watermark_produce_id="",
+        invisible_watermark_reserved_code1="",
+        invisible_watermark_propagator="",
+        invisible_watermark_propagate_id="",
+        invisible_watermark_reserved_code2="",
     ):
         """Upload audio to OSS and return URL"""
+        raw_wav_path = None
+        final_audio_path = None
         try:
             # This will trigger the LazyAudioMap if that's what is passed
             waveform = audio["waveform"]
@@ -686,13 +710,12 @@ class OSSAudioUploader:
             if random_filename:
                 filename = self.generate_random_filename("wav")
 
-            if not filename.lower().endswith((".wav", ".mp3", ".flac")):
+            if not filename.lower().endswith(AUDIO_EXTENSIONS):
                 filename += ".wav"
 
-            # Prepare temp file path
-            temp_path = os.path.join(folder_paths.get_temp_directory(), filename)
+            ext = os.path.splitext(filename)[1].lower()
 
-            # Save audio to temporary file
+            # Save raw waveform to temporary WAV file
             waveform_np = waveform.cpu().numpy()
             if len(waveform_np.shape) == 3:
                 waveform_np = waveform_np[0]
@@ -703,16 +726,37 @@ class OSSAudioUploader:
             ):
                 waveform_np = waveform_np.T
 
-            scipy.io.wavfile.write(temp_path, sample_rate, waveform_np)
+            raw_wav_path = _make_temp_path("raw_audio.wav")
+            scipy.io.wavfile.write(raw_wav_path, sample_rate, waveform_np)
+
+            upload_source = raw_wav_path
+            metadata = None
+            if enable_invisible_watermark:
+                metadata = build_aigc_metadata(
+                    label=invisible_watermark_label,
+                    content_producer=invisible_watermark_producer,
+                    produce_id=invisible_watermark_produce_id,
+                    reserved_code1=invisible_watermark_reserved_code1,
+                    content_propagator=invisible_watermark_propagator,
+                    propagate_id=invisible_watermark_propagate_id,
+                    reserved_code2=invisible_watermark_reserved_code2,
+                )
+
+            if metadata is not None or ext != ".wav":
+                final_audio_path = _make_temp_path(f"audio{ext}")
+                embed_audio_watermark(raw_wav_path, final_audio_path, metadata=metadata)
+                upload_source = final_audio_path
+                if metadata:
+                    print(
+                        f"Embedded GB 45438 invisible watermark into audio (Producer={metadata.content_producer}, ProduceID={metadata.produce_id})"
+                    )
 
             # Setup OSS auth and upload
             auth = oss2.Auth(access_key, access_secret)
             bucket_obj = oss2.Bucket(auth, endpoint, bucket)
             oss_path = os.path.join(path, filename).replace("\\", "/")
 
-            _upload_with_retry(bucket_obj, oss_path, temp_path)
-
-            os.remove(temp_path)
+            _upload_with_retry(bucket_obj, oss_path, upload_source)
 
             # Construct URL
             if endpoint.startswith("https://"):
@@ -730,6 +774,13 @@ class OSSAudioUploader:
         except Exception as e:
             print(f"Error uploading audio to OSS: {str(e)}")
             return (f"Error: {str(e)}",)
+        finally:
+            for p in (raw_wav_path, final_audio_path):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
 
 class OSSFileUploader:
@@ -906,6 +957,14 @@ class OSSFileUploader:
                         temp_file_path,
                         metadata=metadata,
                         visible_config=visible_cfg,
+                    )
+                    upload_source = temp_file_path
+                elif ext_lower in AUDIO_EXTENSIONS and metadata is not None:
+                    temp_file_path = _make_temp_path(f"watermarked{ext_lower}")
+                    embed_audio_watermark(
+                        file_path,
+                        temp_file_path,
+                        metadata=metadata,
                     )
                     upload_source = temp_file_path
                 else:

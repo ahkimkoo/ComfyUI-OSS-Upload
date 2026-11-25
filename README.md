@@ -9,7 +9,7 @@ A ComfyUI plugin for uploading generated images and videos to Alibaba Cloud OSS 
 - **Audio Upload Node**: Upload audio files to OSS
 - **File Upload Node**: Upload arbitrary local files to OSS
 - **Dual Watermarking (Invisible + Visible)**:
-  - **Invisible Watermark (GB 45438-2025)**: Enabled by default for images (PNG/JPEG/WebP) and videos (MP4/MOV/MKV/WebM/AVI/GIF) with default platform producer `CAICAI-菜菜AI`, lossless metadata writing, and extensible blind-watermark hooks
+  - **Invisible Watermark (GB 45438-2025)**: Enabled by default for images (PNG/JPEG/WebP), videos (MP4/MOV/MKV/WebM/AVI/GIF), and audio (WAV/MP3/FLAC/M4A/OGG/OPUS/AAC) with default platform producer `CAICAI-菜菜AI`, lossless metadata writing, and extensible blind-watermark hooks
   - **Visible Watermark**: Disabled by default; supports watermark image URL (with caching) or local path, 9-grid position, flexible sizing, margin, and opacity for both images and videos
 - **Automatic Retry**: Automatically retries uploads up to 20 times on failure
 - **Random Filename Generation**: Option to generate random filenames with timestamp
@@ -89,7 +89,7 @@ Example: `20241210_143052_a3k9m2p7.png`
 
 ## Dual Watermarking (Invisible + Visible)
 
-`OSSImageUploader` and `OSSVideoUploader` support two independent optional watermark groups (fully backward-compatible with existing workflows; `OSSFileUploader` also exposes both groups for image/video files):
+`OSSImageUploader`, `OSSVideoUploader`, and `OSSAudioUploader` support GB 45438-2025 invisible watermarking by default; `OSSImageUploader` and `OSSVideoUploader` additionally support visible image overlay watermarking (all inputs are optional and backward-compatible; `OSSFileUploader` supports all three media types when opted in):
 
 ### 1. Invisible Watermark Group (隐形水印 — GB 45438-2025)
 Enabled by default on image & video nodes. When not specified by the caller, the system default is applied with platform producer **`CAICAI-菜菜AI`**.
@@ -156,17 +156,20 @@ Example ComfyUI workflow node inputs (for AI platform task submission):
   - Invisible watermark only: fast lossless stream copy (`ffmpeg -c copy`)
   - Visible watermark enabled: single-pass FFmpeg YUV420 overlay using NVIDIA `h264_nvenc` when available (auto-fallback to CPU `libx264 -preset veryfast`, configurable via `AIGC_VIDEO_PRESET` / `AIGC_DISABLE_NVENC`), `-c:a copy` preserves audio + invisible metadata written in the same pass
 - **GIF**: Composites visible watermark onto every frame while preserving animation timing + writes GB 45438 `comment` block
+- **Audio (WAV / MP3 / FLAC / M4A / OGG / OPUS / AAC)**: Lossless `ffmpeg -c copy` metadata injection (WAV RIFF INFO with pure-Python fallback, MP3 ID3v2, FLAC Vorbis Comments, M4A QuickTime atoms)
 
 ### Future Blind Watermark Extension
-`watermark.py` exposes `register_image_watermark_hook` and `register_video_watermark_hook` so pixel/frame-level blind watermarking (e.g., TrustMark, Video Seal, or cloud MPS) can be plugged in later without changing node interfaces.
+`watermark.py` exposes `register_image_watermark_hook`, `register_video_watermark_hook`, and `register_audio_watermark_hook` so pixel/frame/waveform blind watermarking (e.g., TrustMark, Video Seal, AudioSeal, or cloud MPS) can be plugged in later without changing node interfaces.
 
 ### Quick Verification
 ```bash
-# Verify video metadata
+# Verify video or audio metadata
 ffprobe -v quiet -print_format json -show_format downloaded.mp4
+ffprobe -v quiet -print_format json -show_format downloaded.wav
 
-# Verify image or video via bundled helper
+# Verify image, video, or audio via bundled helper
 python3 -c "import watermark; print(watermark.read_image_watermark('downloaded.png'))"
+python3 -c "import watermark; print(watermark.read_audio_watermark('downloaded.wav'))"
 ```
 
 ## Security Notes
