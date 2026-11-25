@@ -2,6 +2,7 @@ import os
 import random
 import string
 import time
+import uuid
 from datetime import datetime
 from typing import List, Tuple, Union
 import torch
@@ -11,6 +12,177 @@ import oss2
 import folder_paths
 import comfy.utils
 import scipy.io.wavfile
+
+try:
+    from .watermark import (
+        DEFAULT_CONTENT_PRODUCER,
+        IMAGE_EXTENSIONS,
+        VIDEO_EXTENSIONS,
+        VISIBLE_WATERMARK_POSITIONS,
+        build_aigc_metadata,
+        build_visible_watermark,
+        embed_image_file_watermark,
+        embed_video_watermark,
+        save_image_with_watermark,
+    )
+except ImportError:
+    from watermark import (
+        DEFAULT_CONTENT_PRODUCER,
+        IMAGE_EXTENSIONS,
+        VIDEO_EXTENSIONS,
+        VISIBLE_WATERMARK_POSITIONS,
+        build_aigc_metadata,
+        build_visible_watermark,
+        embed_image_file_watermark,
+        embed_video_watermark,
+        save_image_with_watermark,
+    )
+
+
+def _watermark_optional_inputs(default_invisible_enabled: bool = True):
+    """
+    Shared optional ComfyUI inputs exposing two watermark groups:
+    1. Invisible watermark (GB 45438-2025 implicit metadata, default ON with producer "CAICAI-菜菜AI")
+    2. Visible watermark (image URL overlay, default OFF)
+    """
+    return {
+        # --- Invisible Watermark Group (隐形水印组) ---
+        "enable_invisible_watermark": ("BOOLEAN", {"default": default_invisible_enabled}),
+        "invisible_watermark_label": (["1", "2", "3"], {"default": "1"}),
+        "invisible_watermark_producer": (
+            "STRING",
+            {
+                "default": "",
+                "multiline": False,
+                "placeholder": f"平台名称/编码 (留空默认 {DEFAULT_CONTENT_PRODUCER})",
+            },
+        ),
+        "invisible_watermark_produce_id": (
+            "STRING",
+            {
+                "default": "",
+                "multiline": False,
+                "placeholder": "内容唯一ID (留空自动生成)",
+            },
+        ),
+        "invisible_watermark_reserved_code1": (
+            "STRING",
+            {
+                "default": "",
+                "multiline": False,
+                "placeholder": "预留字段1/签名校验码 (可选)",
+            },
+        ),
+        "invisible_watermark_propagator": (
+            "STRING",
+            {
+                "default": "",
+                "multiline": False,
+                "placeholder": "传播平台名称/编码 (可选)",
+            },
+        ),
+        "invisible_watermark_propagate_id": (
+            "STRING",
+            {
+                "default": "",
+                "multiline": False,
+                "placeholder": "传播唯一ID (可选)",
+            },
+        ),
+        "invisible_watermark_reserved_code2": (
+            "STRING",
+            {
+                "default": "",
+                "multiline": False,
+                "placeholder": "预留字段2 (可选)",
+            },
+        ),
+        # --- Visible Watermark Group (显性水印组) ---
+        "enable_visible_watermark": ("BOOLEAN", {"default": False}),
+        "visible_watermark_url": (
+            "STRING",
+            {
+                "default": "",
+                "multiline": False,
+                "placeholder": "显性水印图片URL或本地路径 (默认不加)",
+            },
+        ),
+        "visible_watermark_position": (
+            list(VISIBLE_WATERMARK_POSITIONS),
+            {"default": "bottom_right"},
+        ),
+        "visible_watermark_size": (
+            "STRING",
+            {
+                "default": "15%",
+                "multiline": False,
+                "placeholder": "尺寸: 如 15%、200px、200x80、20%x10%",
+            },
+        ),
+        "visible_watermark_margin": (
+            "INT",
+            {"default": 20, "min": 0, "max": 500, "step": 1},
+        ),
+        "visible_watermark_opacity": (
+            "FLOAT",
+            {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05},
+        ),
+    }
+
+
+def _resolve_watermark_configs(
+    enable_invisible_watermark: bool,
+    invisible_watermark_label: str,
+    invisible_watermark_producer: str,
+    invisible_watermark_produce_id: str,
+    invisible_watermark_reserved_code1: str,
+    invisible_watermark_propagator: str,
+    invisible_watermark_propagate_id: str,
+    invisible_watermark_reserved_code2: str,
+    enable_visible_watermark: bool,
+    visible_watermark_url: str,
+    visible_watermark_position: str,
+    visible_watermark_size: str,
+    visible_watermark_margin: int,
+    visible_watermark_opacity: float,
+):
+    """Build (AIGCMetadata | None, VisibleWatermarkConfig | None) from node inputs."""
+    metadata = None
+    if enable_invisible_watermark:
+        metadata = build_aigc_metadata(
+            label=invisible_watermark_label,
+            content_producer=invisible_watermark_producer,
+            produce_id=invisible_watermark_produce_id,
+            reserved_code1=invisible_watermark_reserved_code1,
+            content_propagator=invisible_watermark_propagator,
+            propagate_id=invisible_watermark_propagate_id,
+            reserved_code2=invisible_watermark_reserved_code2,
+        )
+
+    visible_cfg = None
+    if enable_visible_watermark:
+        visible_cfg = build_visible_watermark(
+            image_url=visible_watermark_url,
+            position=visible_watermark_position,
+            size=visible_watermark_size,
+            margin=visible_watermark_margin,
+            opacity=visible_watermark_opacity,
+        )
+        if visible_cfg is None:
+            print(
+                "[WARNING] enable_visible_watermark is True but visible_watermark_url is empty; skipping visible watermark."
+            )
+
+    return metadata, visible_cfg
+
+
+def _make_temp_path(filename: str) -> str:
+    """Create a collision-free temporary file path inside ComfyUI's temp directory."""
+    safe_name = os.path.basename(filename)
+    return os.path.join(
+        folder_paths.get_temp_directory(),
+        f"oss_upload_{uuid.uuid4().hex[:10]}_{safe_name}",
+    )
 
 
 def _upload_with_retry(bucket_obj, oss_path, local_path, max_retries=20, retry_delay=3):
@@ -89,7 +261,8 @@ class OSSImageUploader:
                         "placeholder": "Filename (only used when random_filename is False)",
                     },
                 ),
-            }
+            },
+            "optional": _watermark_optional_inputs(default_invisible_enabled=True),
         }
 
     RETURN_TYPES = ("STRING",)
@@ -115,8 +288,23 @@ class OSSImageUploader:
         path,
         random_filename,
         filename,
+        enable_invisible_watermark=True,
+        invisible_watermark_label="1",
+        invisible_watermark_producer="",
+        invisible_watermark_produce_id="",
+        invisible_watermark_reserved_code1="",
+        invisible_watermark_propagator="",
+        invisible_watermark_propagate_id="",
+        invisible_watermark_reserved_code2="",
+        enable_visible_watermark=False,
+        visible_watermark_url="",
+        visible_watermark_position="bottom_right",
+        visible_watermark_size="15%",
+        visible_watermark_margin=20,
+        visible_watermark_opacity=1.0,
     ):
         """Upload image to OSS and return URL"""
+        temp_path = None
         try:
             if isinstance(IMAGE, torch.Tensor):
                 if len(IMAGE.shape) == 4:
@@ -131,7 +319,7 @@ class OSSImageUploader:
             if random_filename:
                 filename = self.generate_random_filename("png")
 
-            if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            if not filename.lower().endswith(IMAGE_EXTENSIONS):
                 filename += ".png"
 
             auth = oss2.Auth(access_key, access_secret)
@@ -139,12 +327,40 @@ class OSSImageUploader:
 
             oss_path = os.path.join(path, filename).replace("\\", "/")
 
-            temp_path = os.path.join(folder_paths.get_temp_directory(), filename)
-            pil_image.save(temp_path, "PNG")
+            metadata, visible_cfg = _resolve_watermark_configs(
+                enable_invisible_watermark=enable_invisible_watermark,
+                invisible_watermark_label=invisible_watermark_label,
+                invisible_watermark_producer=invisible_watermark_producer,
+                invisible_watermark_produce_id=invisible_watermark_produce_id,
+                invisible_watermark_reserved_code1=invisible_watermark_reserved_code1,
+                invisible_watermark_propagator=invisible_watermark_propagator,
+                invisible_watermark_propagate_id=invisible_watermark_propagate_id,
+                invisible_watermark_reserved_code2=invisible_watermark_reserved_code2,
+                enable_visible_watermark=enable_visible_watermark,
+                visible_watermark_url=visible_watermark_url,
+                visible_watermark_position=visible_watermark_position,
+                visible_watermark_size=visible_watermark_size,
+                visible_watermark_margin=visible_watermark_margin,
+                visible_watermark_opacity=visible_watermark_opacity,
+            )
+
+            temp_path = _make_temp_path(filename)
+            save_image_with_watermark(
+                pil_image,
+                temp_path,
+                metadata=metadata,
+                visible_config=visible_cfg,
+            )
+            if visible_cfg:
+                print(
+                    f"Applied visible watermark to image (pos={visible_cfg.position}, size={visible_cfg.size})"
+                )
+            if metadata:
+                print(
+                    f"Embedded GB 45438 invisible watermark into image (Producer={metadata.content_producer}, ProduceID={metadata.produce_id})"
+                )
 
             _upload_with_retry(bucket_obj, oss_path, temp_path)
-
-            os.remove(temp_path)
 
             if endpoint.startswith("https://"):
                 base_url = endpoint.replace("https://", f"https://{bucket}.")
@@ -161,6 +377,12 @@ class OSSImageUploader:
         except Exception as e:
             print(f"Error uploading image to OSS: {str(e)}")
             return (f"Error: {str(e)}",)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
 
 class OSSVideoUploader:
@@ -219,7 +441,8 @@ class OSSVideoUploader:
                         "placeholder": "Filename (only used when random_filename is False)",
                     },
                 ),
-            }
+            },
+            "optional": _watermark_optional_inputs(default_invisible_enabled=True),
         }
 
     RETURN_TYPES = ("STRING",)
@@ -245,8 +468,23 @@ class OSSVideoUploader:
         path,
         random_filename,
         filename,
+        enable_invisible_watermark=True,
+        invisible_watermark_label="1",
+        invisible_watermark_producer="",
+        invisible_watermark_produce_id="",
+        invisible_watermark_reserved_code1="",
+        invisible_watermark_propagator="",
+        invisible_watermark_propagate_id="",
+        invisible_watermark_reserved_code2="",
+        enable_visible_watermark=False,
+        visible_watermark_url="",
+        visible_watermark_position="bottom_right",
+        visible_watermark_size="15%",
+        visible_watermark_margin=20,
+        visible_watermark_opacity=1.0,
     ):
         """Upload video to OSS and return URL"""
+        temp_video_path = None
         try:
             video_path = None
             if isinstance(VHS_FILENAMES, (list, tuple)) and len(VHS_FILENAMES) >= 2:
@@ -256,16 +494,14 @@ class OSSVideoUploader:
                     video_files = [
                         f
                         for f in VHS_FILENAMES[1]
-                        if f.lower().endswith(
-                            (".mp4", ".avi", ".mov", ".webm", ".mkv", ".gif")
-                        )
+                        if f.lower().endswith(VIDEO_EXTENSIONS)
                     ]
                     if video_files:
                         video_path = video_files[-1]
                 else:
                     for item in VHS_FILENAMES:
                         if isinstance(item, str) and item.lower().endswith(
-                            (".mp4", ".avi", ".mov", ".webm", ".mkv", ".gif")
+                            VIDEO_EXTENSIONS
                         ):
                             video_path = item
                             break
@@ -288,9 +524,7 @@ class OSSVideoUploader:
             if random_filename:
                 filename = self.generate_random_filename(ext.lstrip("."))
             else:
-                if not filename.lower().endswith(
-                    (".mp4", ".avi", ".mov", ".webm", ".mkv", ".gif")
-                ):
+                if not filename.lower().endswith(VIDEO_EXTENSIONS):
                     filename += ext
 
             auth = oss2.Auth(access_key, access_secret)
@@ -298,7 +532,43 @@ class OSSVideoUploader:
 
             oss_path = os.path.join(path, filename).replace("\\", "/")
 
-            _upload_with_retry(bucket_obj, oss_path, video_path)
+            metadata, visible_cfg = _resolve_watermark_configs(
+                enable_invisible_watermark=enable_invisible_watermark,
+                invisible_watermark_label=invisible_watermark_label,
+                invisible_watermark_producer=invisible_watermark_producer,
+                invisible_watermark_produce_id=invisible_watermark_produce_id,
+                invisible_watermark_reserved_code1=invisible_watermark_reserved_code1,
+                invisible_watermark_propagator=invisible_watermark_propagator,
+                invisible_watermark_propagate_id=invisible_watermark_propagate_id,
+                invisible_watermark_reserved_code2=invisible_watermark_reserved_code2,
+                enable_visible_watermark=enable_visible_watermark,
+                visible_watermark_url=visible_watermark_url,
+                visible_watermark_position=visible_watermark_position,
+                visible_watermark_size=visible_watermark_size,
+                visible_watermark_margin=visible_watermark_margin,
+                visible_watermark_opacity=visible_watermark_opacity,
+            )
+
+            upload_source = video_path
+            if metadata is not None or visible_cfg is not None:
+                temp_video_path = _make_temp_path(f"watermarked{ext}")
+                embed_video_watermark(
+                    video_path,
+                    temp_video_path,
+                    metadata=metadata,
+                    visible_config=visible_cfg,
+                )
+                upload_source = temp_video_path
+                if visible_cfg:
+                    print(
+                        f"Applied visible watermark to video (pos={visible_cfg.position}, size={visible_cfg.size})"
+                    )
+                if metadata:
+                    print(
+                        f"Embedded GB 45438 invisible watermark into video (Producer={metadata.content_producer}, ProduceID={metadata.produce_id})"
+                    )
+
+            _upload_with_retry(bucket_obj, oss_path, upload_source)
 
             if endpoint.startswith("https://"):
                 base_url = endpoint.replace("https://", f"https://{bucket}.")
@@ -315,6 +585,12 @@ class OSSVideoUploader:
         except Exception as e:
             print(f"Error uploading video to OSS: {str(e)}")
             return (f"Error: {str(e)}",)
+        finally:
+            if temp_video_path and os.path.exists(temp_video_path):
+                try:
+                    os.remove(temp_video_path)
+                except OSError:
+                    pass
 
 
 class OSSAudioUploader:
@@ -519,7 +795,8 @@ class OSSFileUploader:
                         "placeholder": "Filename (only used when random_filename is False)",
                     },
                 ),
-            }
+            },
+            "optional": _watermark_optional_inputs(default_invisible_enabled=False),
         }
 
     RETURN_TYPES = ("STRING",)
@@ -545,8 +822,23 @@ class OSSFileUploader:
         path,
         random_filename,
         filename,
+        enable_invisible_watermark=False,
+        invisible_watermark_label="1",
+        invisible_watermark_producer="",
+        invisible_watermark_produce_id="",
+        invisible_watermark_reserved_code1="",
+        invisible_watermark_propagator="",
+        invisible_watermark_propagate_id="",
+        invisible_watermark_reserved_code2="",
+        enable_visible_watermark=False,
+        visible_watermark_url="",
+        visible_watermark_position="bottom_right",
+        visible_watermark_size="15%",
+        visible_watermark_margin=20,
+        visible_watermark_opacity=1.0,
     ):
         """Upload local file to OSS and return URL"""
+        temp_file_path = None
         try:
             # Validate file path
             if not file_path:
@@ -578,7 +870,50 @@ class OSSFileUploader:
 
             oss_path = os.path.join(path, filename).replace("\\", "/")
 
-            _upload_with_retry(bucket_obj, oss_path, file_path)
+            metadata, visible_cfg = _resolve_watermark_configs(
+                enable_invisible_watermark=enable_invisible_watermark,
+                invisible_watermark_label=invisible_watermark_label,
+                invisible_watermark_producer=invisible_watermark_producer,
+                invisible_watermark_produce_id=invisible_watermark_produce_id,
+                invisible_watermark_reserved_code1=invisible_watermark_reserved_code1,
+                invisible_watermark_propagator=invisible_watermark_propagator,
+                invisible_watermark_propagate_id=invisible_watermark_propagate_id,
+                invisible_watermark_reserved_code2=invisible_watermark_reserved_code2,
+                enable_visible_watermark=enable_visible_watermark,
+                visible_watermark_url=visible_watermark_url,
+                visible_watermark_position=visible_watermark_position,
+                visible_watermark_size=visible_watermark_size,
+                visible_watermark_margin=visible_watermark_margin,
+                visible_watermark_opacity=visible_watermark_opacity,
+            )
+
+            upload_source = file_path
+            if metadata is not None or visible_cfg is not None:
+                ext_lower = ext.lower()
+                if ext_lower in IMAGE_EXTENSIONS:
+                    temp_file_path = _make_temp_path(f"watermarked{ext_lower}")
+                    embed_image_file_watermark(
+                        file_path,
+                        temp_file_path,
+                        metadata=metadata,
+                        visible_config=visible_cfg,
+                    )
+                    upload_source = temp_file_path
+                elif ext_lower in VIDEO_EXTENSIONS:
+                    temp_file_path = _make_temp_path(f"watermarked{ext_lower}")
+                    embed_video_watermark(
+                        file_path,
+                        temp_file_path,
+                        metadata=metadata,
+                        visible_config=visible_cfg,
+                    )
+                    upload_source = temp_file_path
+                else:
+                    print(
+                        f"[INFO] Watermarking skipped for unsupported file extension: {ext or '(none)'}"
+                    )
+
+            _upload_with_retry(bucket_obj, oss_path, upload_source)
 
             # Construct URL
             if endpoint.startswith("https://"):
@@ -596,6 +931,12 @@ class OSSFileUploader:
         except Exception as e:
             print(f"Error uploading file to OSS: {str(e)}")
             return (f"Error: {str(e)}",)
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
 
 
 NODE_CLASS_MAPPINGS = {
